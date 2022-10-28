@@ -71,14 +71,14 @@ struct request
   pld_type<Payload, AttrsLen> m_pld;
   //TYPEDEF_ASSERT( NLMSG_ALIGN(sizeof(nlmsghdr)) == offsetof(m_pld) );
 
-  request( uint16_t _type, uint32_t _seqnum, uint32_t _pid, uint16_t _flags = NLM_F_REQUEST )
+  request( uint16_t _type, uint16_t _flags = NLM_F_REQUEST )
   {
     memset(&m_pld, 0, sizeof(m_pld));
     hdr.nlmsg_len = NLMSG_LENGTH(sizeof(Payload));
     hdr.nlmsg_type = _type;
     hdr.nlmsg_flags = _flags;
-    hdr.nlmsg_seq = _seqnum; // Sequence number
-    hdr.nlmsg_pid = _pid; // Sender port ID
+    //hdr.nlmsg_seq = _seqnum; // Sequence number
+    //hdr.nlmsg_pid = _pid; // Sender port ID
   }
 
   //nlmsghdr& hdr() { return hdr; }
@@ -112,13 +112,13 @@ template<>
 struct request<void, 0>
 {
   nlmsghdr hdr;
-  request( uint16_t _type, uint32_t _seqnum, uint32_t _pid, uint16_t _flags = NLM_F_REQUEST )
+  request( uint16_t _type, uint16_t _flags = NLM_F_REQUEST )
   {
     hdr.nlmsg_len = NLMSG_LENGTH(0);
     hdr.nlmsg_type = _type;
     hdr.nlmsg_flags = _flags;
-    hdr.nlmsg_seq = _seqnum; // Sequence number
-    hdr.nlmsg_pid = _pid; // Sender port ID
+    //hdr.nlmsg_seq = _seqnum; // Sequence number
+    //hdr.nlmsg_pid = _pid; // Sender port ID
   }
 };
 
@@ -138,7 +138,7 @@ struct response
 struct rtattr_iterator
 {
   const rtattr* attr;
-  int  len;
+  int  len; // total length of rest attrs
 
   bool end() const {
     return !RTA_OK(attr, len);
@@ -308,9 +308,11 @@ struct cmdsocket
   static inline handle_t INVALID_HANDLE() { return -1; }
 #endif
   handle_t    handle;
+  uint32_t    nlmsg_seq;    /* Sequence number */
+  uint32_t    nlmsg_pid;    /* Sender port ID */
   std::string lasterr;
 
-  cmdsocket() : handle(INVALID_HANDLE()) {}
+  cmdsocket() : handle(INVALID_HANDLE()), nlmsg_seq(0) {}
   ~cmdsocket()
   {
 #ifndef WINXX
@@ -338,12 +340,17 @@ struct cmdsocket
     MEMZERO( &addr, sizeof(addr) );
     addr.nl_family = AF_NETLINK; /* fill-in kernel address (destination of our message) */
     addr.nl_groups = _nl_groups;
+    //addr.nl_pid;     /* Port ID */ // If the application sets it to 0, the kernel takes care of assigning it.
     if( ::bind(handle, (struct sockaddr*)&addr, sizeof(addr)) ) {
       get_last_error_( &lasterr, "bind() " );
       ::close(handle);
       handle = INVALID_HANDLE();
       return false;
     }
+    socklen_t sz = sizeof(addr);
+    getsockname( handle, (struct sockaddr*)&addr, &sz );
+    ASSERT( 0 != addr.nl_pid );
+    nlmsg_pid = addr.nl_pid;
 #endif
     return true;
   }
@@ -357,6 +364,8 @@ struct cmdsocket
     MEMZERO( &addr, sizeof(addr) );
     addr.nl_family = AF_NETLINK;
     ASSERT( 0 != hdr.nlmsg_len );
+    const_cast<struct nlmsghdr&>(hdr).nlmsg_pid = this->nlmsg_pid;
+    const_cast<struct nlmsghdr&>(hdr).nlmsg_seq = this->nlmsg_seq++;
     for( ;; )
     {
       ssize_t res = ::sendto(handle, (const char*)&hdr, hdr.nlmsg_len, 0, (sockaddr*)(&addr), sizeof(addr));
