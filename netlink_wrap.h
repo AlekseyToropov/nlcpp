@@ -13,6 +13,25 @@
 #endif
 #include <string>
 
+#ifndef MEMCPY
+#define MEMCPY           memcpy
+#endif
+#ifndef MEMZERO
+#define MEMZERO(a,sz)    memset(a, 0, sz)
+#endif
+#ifndef SNPRINTF
+#define SNPRINTF         snprintf
+#endif
+#ifndef ASSERT
+#define ASSERT(...)
+#endif
+
+#ifdef WINXX
+static inline int ws_size_cast_(size_t x) { return (int)x; }
+#else
+#define ws_size_cast_(x)    x
+#endif
+
 namespace netlink
 {
 
@@ -73,7 +92,7 @@ struct request
 
   request( uint16_t _type, uint16_t _flags = NLM_F_REQUEST )
   {
-    memset(&m_pld, 0, sizeof(m_pld));
+    MEMZERO(&m_pld, sizeof(m_pld));
     hdr.nlmsg_len = NLMSG_LENGTH(sizeof(Payload));
     hdr.nlmsg_type = _type;
     hdr.nlmsg_flags = _flags;
@@ -126,13 +145,19 @@ struct request<void, 0>
 template< size_t N >
 struct response
 {
-  ssize_t len;
+  size_t len;
   union {
     struct nlmsghdr hdr;
     char buf[N];
-  } data;
+  } dt;
 
   response() : len(0) {}
+  const void* data() const { return &dt; }
+  size_t size() const { return len; }
+  size_t capacity() const { return sizeof(dt); }
+  void resize( size_t _len ) { ASSERT( _len <= capacity() ); len = _len; }
+
+  const nlmsghdr* hdr() const { return &dt.hdr; }
 };
 
 struct rtattr_iterator
@@ -153,7 +178,7 @@ struct rtattr_iterator
   unsigned short type() const {
     return attr->rta_type;
   }
-  void* data() const {
+  const void* data() const {
     return RTA_DATA(attr);
   }
   int   datalen() const {
@@ -183,8 +208,8 @@ struct msg_iterator_base
   const nlmsghdr* msg;
   int  len;
 
-  template< size_t N >
-  msg_iterator_base(response<N>& _resp) : msg(&_resp.data.hdr), len((int)_resp.len) { ASSERT( NLMSG_ALIGN(msg->nlmsg_len) <= (unsigned)NLMSG_ALIGN(len) ); find(); }
+  template< class T >
+  msg_iterator_base( T& _resp ) : msg((const nlmsghdr*)_resp.data()), len((int)_resp.size()) { ASSERT( NLMSG_ALIGN(msg->nlmsg_len) <= (unsigned)NLMSG_ALIGN(len) ); find(); }
 
   void find() {
     for( ; !end() && !msg_type<MsgType>::check(msg); ) {
@@ -227,7 +252,16 @@ struct msg_t
 {
   const nlmsghdr* hdr;
   msg_t( const nlmsghdr* _hdr ) : hdr(_hdr) {}
-  const Payload*  pld() const {  return (const Payload*)NLMSG_DATA(hdr); }
+
+  const Payload*  pld() const {
+    return (const Payload*)NLMSG_DATA(hdr);
+  }
+  uint16_t type() const {
+    return hdr->nlmsg_type;
+  }
+  int pldlen() const {
+    return NLMSG_PAYLOAD(hdr, 0); // nlmsg_len - <hdr len>
+  }
   rtattr_iterator attrs() const
   {
     rtattr_iterator it;
@@ -249,8 +283,8 @@ template<>
 struct msg_iterator< 0, void > : msg_iterator_base<0>
 {
   typedef msg_iterator_base<0> base_t;
-  template< size_t N >
-  msg_iterator(response<N>& _resp) : base_t(_resp) {}
+  template< class T >
+  msg_iterator(T& _resp) : base_t(_resp) {}
 
   template< typename Payload >
   msg_t<Payload> get() const { return msg_t<Payload>(base_t::msg); }
@@ -260,8 +294,8 @@ template< uint16_t MsgType >
 struct msg_iterator< MsgType, void > : msg_iterator_base<MsgType>
 {
   typedef msg_iterator_base<MsgType> base_t;
-  template< size_t N >
-  msg_iterator(response<N>& _resp) : base_t(_resp) {}
+  template< class T >
+  msg_iterator(T& _resp) : base_t(_resp) {}
 
   template< typename Payload >
   msg_t<Payload> get() const { return msg_t<Payload>(base_t::msg); }
@@ -271,8 +305,8 @@ template< uint16_t MsgType, class Payload >
 struct msg_iterator : msg_iterator_base<MsgType>
 {
   typedef msg_iterator_base<MsgType> base_t;
-  template< size_t N >
-  msg_iterator(response<N>& _resp) : base_t(_resp) {}
+  template< class T >
+  msg_iterator(T& _resp) : base_t(_resp) {}
 
   msg_t<Payload> get() const { return msg_t<Payload>(base_t::msg); }
   const Payload* pld() const { return get().pld(); }
@@ -289,7 +323,7 @@ static inline void format_error_( std::string* _out, const char* _pref, int _err
   //*_out += strerror(_err);
   char buf[1024];
   *_out += strerror_r( _err, buf, sizeof(buf) );
-  SNPRINTF( buf, sizeof(buf), " (%d)", _err );
+  SNPRINTF( buf, sizeof(buf), " (%d)", _err ); // TODO use std::to_string
   *_out += buf;
 }
 
@@ -348,7 +382,7 @@ struct cmdsocket
       return false;
     }
     socklen_t sz = sizeof(addr);
-    getsockname( handle, (struct sockaddr*)&addr, &sz );
+    ::getsockname( handle, (struct sockaddr*)&addr, &sz );
     ASSERT( 0 != addr.nl_pid );
     nlmsg_pid = addr.nl_pid;
 #endif
@@ -388,12 +422,13 @@ struct cmdsocket
   template< class T >
   bool read( T& _response )
   {
-    _response.len = ::recv(handle, (char*)&_response.data, sizeof(_response.data), MSG_DONTWAIT);
-    if( _response.len < 0 || sizeof(_response.data) < _response.len) {
+    ssize_t len = ::recv(handle, (char*)_response.data(), ws_size_cast_(_response.capacity()), MSG_DONTWAIT);
+    if( len < 0 ) {
       get_last_error_( &lasterr, "recv() " );
       return false;
     }
-    ASSERT( _response.len >= _response.data.hdr.nlmsg_len );
+    ASSERT( len >= ((const nlmsghdr*)_response.data())->nlmsg_len );
+    _response.resize((size_t)len);
     return true;
   }
 
